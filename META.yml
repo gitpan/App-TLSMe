@@ -1,0 +1,29 @@
+--- #YAML:1.0
+name:               App-TLSMe
+version:            0.009001
+abstract:           TLS/SSL tunnel
+author:
+    - Viacheslav Tykhanovskyi <vti@cpan.org>
+license:            artistic_2
+distribution_type:  module
+configure_requires:  {}
+build_requires:  {}
+requires:
+    AnyEvent:      5.34
+    Net::SSLeay:   0
+    perl:          5.008007
+    Pod::Usage:    0
+    Scalar::Util:  0
+resources:
+    bugtracker:  http://github.com/vti/app-tlsme/issues
+    license:     http://dev.perl.org/licenses/
+    repository:  http://github.com/vti/app-tlsme
+no_index:
+    directory:
+        - t
+        - inc
+        - t
+generated_by:       ExtUtils::MakeMaker version 6.55_02
+meta-spec:
+    url:      http://module-build.sourceforge.net/META-spec-v1.4.html
+    version:  1.4
