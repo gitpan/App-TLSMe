@@ -3,7 +3,7 @@ package App::TLSMe;
 use strict;
 use warnings;
 
-our $VERSION = '0.009001';
+our $VERSION = '0.009002';
 
 use constant DEBUG => $ENV{APP_TLSME_DEBUG};
 
@@ -73,12 +73,12 @@ sub new {
         $backend_port = File::Spec->rel2abs($args{backend});
     }
 
-    my $tls_ctx;
+    my $tls_ctx = {method => $args{method}};
 
     if (!defined $args{cert_file} && !defined $args{key_file}) {
         DEBUG && warn "Using default certificate and private key values\n";
 
-        $tls_ctx = {cert => CERT, key => KEY};
+        $tls_ctx = {%$tls_ctx, cert => CERT, key => KEY};
     }
     elsif (defined $args{cert_file} && defined $args{key_file}) {
         Carp::croak("Certificate file '$args{cert_file}' does not exist")
@@ -88,7 +88,7 @@ sub new {
 
         $tls_ctx = {
             cert_file => $args{cert_file},
-            key_file  => $args{key_file}
+            key_file  => $args{key_file} % $tls_ctx
         };
     }
     else {
@@ -120,6 +120,14 @@ sub run {
     return $self;
 }
 
+sub stop {
+    my $self = shift;
+
+    $self->{cv}->send;
+
+    return $self;
+}
+
 sub _listen {
     my $self = shift;
 
@@ -142,7 +150,36 @@ sub _accept_handler {
             backend_port => $self->{backend_port},
             peer_host    => $peer_host,
             peer_port    => $peer_port,
-            tls_ctx      => $self->{tls_ctx}
+            tls_ctx      => $self->{tls_ctx},
+            on_eof       => sub {
+                my ($conn) = @_;
+
+                App::TLSMe::Pool->remove_connection($fh);
+            },
+            on_error => sub {
+                my ($conn, $error) = @_;
+
+                if ($error =~ m/ssl23_get_client_hello: http request/) {
+                    my $response = $self->_build_http_response(
+                        '501 Not Implemented',
+                        '<h1>501 Not Implemented</h1><p>Maybe <code>https://</code> instead of <code>http://</code>?</p>'
+                    );
+
+                    syswrite $fh, $response;
+                }
+
+                App::TLSMe::Pool->remove_connection($fh);
+            },
+            on_backend_eof => sub {
+            },
+            on_backend_error => sub {
+                my ($conn, $message) = @_;
+
+                my $response = $self->_build_http_response('502 Bad Gateway',
+                    '<h1>502 Bad Gateway</h1>');
+
+                $conn->write($response);
+            }
         );
     };
 }
@@ -157,6 +194,16 @@ sub _bind_handler {
 
         return 8;
     };
+}
+
+sub _build_http_response {
+    my $self = shift;
+    my ($status_message, $body) = @_;
+
+    my $length = length($body);
+
+    return join "\015\012", "HTTP/1.1 $status_message",
+      "Content-Length: $length", "", $body;
 }
 
 1;
@@ -194,6 +241,12 @@ look at its documentation instead.
 
 Start the secure tunnel.
 
+=head2 C<stop>
+
+    $app->stop;
+
+Stop the secure tunnel (used for testing).
+
 =head1 DEVELOPMENT
 
 =head2 Repository
@@ -206,7 +259,7 @@ Viacheslav Tykhanovskyi, C<vti@cpan.org>.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2011, Viacheslav Tykhanovskyi
+Copyright (C) 2011-2012, Viacheslav Tykhanovskyi
 
 This program is free software, you can redistribute it and/or modify it under
 the terms of the Artistic License version 2.0.

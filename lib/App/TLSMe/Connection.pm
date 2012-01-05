@@ -5,8 +5,6 @@ use warnings;
 
 use constant DEBUG => $ENV{APP_TLSME_DEBUG};
 
-use App::TLSMe::Pool;
-
 use Scalar::Util qw(weaken);
 use AnyEvent::Handle;
 use AnyEvent::Socket;
@@ -17,14 +15,23 @@ sub new {
     my $self = {@_};
     bless $self, $class;
 
-    $self->{handle} = $self->_build_handle(@_);
+    $self->{handle} = $self->_build_handle();
+
+    $self->{on_eof}           ||= sub { };
+    $self->{on_error}         ||= sub { };
+    $self->{on_backend_error} ||= sub { };
 
     return $self;
 }
 
+sub write {
+    my $self = shift;
+
+    $self->{handle}->push_write(@_);
+}
+
 sub _build_handle {
     my $self = shift;
-    my %args = @_;
 
     weaken $self;
 
@@ -37,6 +44,10 @@ sub _build_handle {
 
             DEBUG && warn "Client $self->{fh} disconnected\n";
 
+            if (my $backend_handle = delete $self->{backend_handle}) {
+                $self->_close_handle($backend_handle);
+            }
+
             $self->_drop;
         },
         on_error => sub {
@@ -45,7 +56,11 @@ sub _build_handle {
 
             DEBUG && warn "Error: $message\n";
 
-            $self->_drop;
+            if (my $backend_handle = delete $self->{backend_handle}) {
+                $self->_close_handle($backend_handle);
+            }
+
+            $self->_drop($message);
         },
         on_starttls => $self->_on_starttls_handler
     );
@@ -53,12 +68,22 @@ sub _build_handle {
 
 sub _drop {
     my $self = shift;
+    my ($error) = @_;
+
+    if (defined $error) {
+        $self->{on_error}->($self, $error);
+    }
+    else {
+        $self->{on_eof}->($self);
+    }
 
     DEBUG && warn "Connection $self->{fh} closed\n";
 
-    $self->{handle}->destroy;
+    my $handle = delete $self->{handle};
 
-    App::TLSMe::Pool->remove_connection($self->{fh});
+    $self->_close_handle($handle);
+
+    undef $handle;
 
     return $self;
 }
@@ -75,7 +100,7 @@ sub _on_starttls_handler {
         if (!$is_success) {
             DEBUG && warn "TLS error: $message\n";
 
-            return $self->_drop;
+            return $self->_drop($message);
         }
 
         DEBUG && warn "$message\n";
@@ -100,19 +125,25 @@ sub _connect_to_backend {
               && warn
               "Connection to backend $backend_host:$backend_port failed: $!\n";
 
+            $self->{on_backend_error}->($self);
             return $self->_drop;
         }
 
         DEBUG && warn "Connected to backend $backend_host:$backend_port\n";
+
+        return unless $self->{handle};
 
         my $backend_handle = $self->{backend_handle} = AnyEvent::Handle->new(
             fh     => $backend_fh,
             on_eof => sub {
                 my $backend_handle = shift;
 
-                DEBUG && 'Backend disconnected';
+                DEBUG && warn "Backend disconnected\n";
 
-                $backend_handle->destroy;
+                $self->{on_backend_eof}->($self);
+
+                $self->_close_handle($backend_handle);
+                delete $self->{backend_handle};
 
                 $self->_drop;
             },
@@ -122,15 +153,20 @@ sub _connect_to_backend {
 
                 DEBUG && warn "Backend error: $message\n";
 
-                $backend_handle->destroy;
+                $self->{on_backend_error}->($self, $message);
+
+                $self->_close_handle($backend_handle);
+                delete $self->{backend_handle};
 
                 $self->_drop;
             }
         );
 
-        $self->{handle}->on_read($self->_on_send_handler);
+        if ($backend_handle) {
+            $self->{handle}->on_read($self->_on_send_handler);
 
-        $backend_handle->on_read($self->_on_read_handler);
+            $backend_handle->on_read($self->_on_read_handler);
+        }
       }
 }
 
@@ -148,14 +184,14 @@ sub _on_send_handler {
 
         if ($headers) {
             $self->{backend_handle}->push_write($handle->rbuf);
-            $handle->rbuf = '';
+            $handle->{rbuf} = '';
         }
         elsif ($handle->rbuf
             =~ s/ (?<=\x0a)\x0d?\x0a /$x_forwarded_for$x_forwarded_proto\x0d\x0a/xms
           )
         {
             $self->{backend_handle}->push_write($handle->rbuf);
-            $handle->rbuf = '';
+            $handle->{rbuf} = '';
 
             $headers = 1;
         }
@@ -168,11 +204,35 @@ sub _on_read_handler {
     weaken $self;
 
     return sub {
-        my $backend_handle = shift;
+        my ($backend_handle) = @_ or return;
 
         $self->{handle}->push_write($backend_handle->rbuf);
-        $backend_handle->rbuf = '';
+        $backend_handle->{rbuf} = '';
       }
+}
+
+sub _close_handle {
+    my $self = shift;
+    my ($handle) = @_;
+
+    $handle->wtimeout(0);
+
+    $handle->on_drain;
+    $handle->on_error;
+
+    $handle->on_drain(
+        sub {
+            if ($_[0]->fh) {
+                shutdown $_[0]->fh, 1;
+                close $handle->fh;
+            }
+
+            $_[0]->destroy;
+            undef $handle;
+        }
+    );
+
+    undef $handle;
 }
 
 1;
@@ -201,5 +261,9 @@ proxy-backend connection.
 =head2 C<new>
 
     my $connection = App::TLSMe::Connection->new;
+
+=head2 C<write>
+
+    $connection->write(...);
 
 =cut
