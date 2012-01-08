@@ -28,4 +28,4 @@ resources:
   bugtracker: http://github.com/vti/app-tlsme/issues
   license: http://dev.perl.org/licenses/
   repository: http://github.com/vti/app-tlsme
-version: 0.009002
+version: 0.009003
