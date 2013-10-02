@@ -25,12 +25,12 @@ tcp_server $backend_host, $backend_port, sub {
     syswrite $fh, "200 OK\015\012";
 };
 
-my $null = '';
-open my $fh, '>', \$null;
 my $tlsme = App::TLSMe->new(
-    logger  => App::TLSMe::Logger->new(fh => $fh),
-    listen  => "$host:$port",
-    backend => "$backend_host:$backend_port"
+    listen    => "$host:$port",
+    backend   => "$backend_host:$backend_port",
+    daemonize => 1,
+    log_file  => '/tmp/log',
+    pid_file  => '/tmp/pid '
 );
 
 my $handle = AnyEvent::Handle->new(

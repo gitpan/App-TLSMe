@@ -3,7 +3,7 @@ package App::TLSMe;
 use strict;
 use warnings;
 
-our $VERSION = '0.10';
+our $VERSION = '0.11';
 
 use constant DEBUG => $ENV{APP_TLSME_DEBUG};
 
@@ -11,10 +11,13 @@ use File::Spec;
 require Carp;
 
 use AnyEvent;
-use AnyEvent::Handle;
+use AnyEvent::TLS;
 use AnyEvent::Socket;
+use POSIX 'setsid', ':sys_wait_h';
+use Proc::Pidfile;
 
 use App::TLSMe::Pool;
+use App::TLSMe::Logger;
 
 use constant CERT => <<'EOF';
 -----BEGIN CERTIFICATE-----
@@ -56,55 +59,46 @@ EOF
 
 sub new {
     my $class = shift;
-    my %args  = @_;
+    my (%args) = @_;
 
-    my ($host, $port) = split ':', delete $args{listen}, -1;
-    $host ||= '0.0.0.0';
-    $port ||= 443;
+    my ($host, $port) = $class->_parse_listen_address($args{listen});
+    my ($backend_host, $backend_port) =
+      $class->_parse_backend_address($args{backend});
 
-    my ($backend_host, $backend_port);
-    if ($args{backend} =~ m/:\d+$/) {
-        ($backend_host, $backend_port) = split ':', delete $args{backend}, -1;
-        $backend_host ||= '127.0.0.1';
-        $backend_port ||= 8080;
-    }
-    else {
-        $backend_host = 'unix/';
-        $backend_port = File::Spec->rel2abs($args{backend});
-    }
-
-    my $tls_ctx = {method => $args{method}};
-
-    if (defined $args{cert_file}) {
-        Carp::croak("Certificate file '$args{cert_file}' does not exist")
-          unless -f $args{cert_file};
-
-        $tls_ctx->{cert_file} = $args{cert_file};
-
-        if ($args{key_file}) {
-            Carp::croak("Private key file '$args{key_file}' does not exist")
-              unless -f $args{key_file};
-
-            $tls_ctx->{key_file} = $args{key_file};
-        }
-
-    }
-    else {
-        DEBUG && warn "Using default certificate and private key values\n";
-
-        $tls_ctx = {%$tls_ctx, cert => CERT, key => KEY};
-    }
+    my $tls_ctx = $class->_build_tls_ctx(%args);
+    $tls_ctx->init;
 
     my $self = {
         host         => $host,
         port         => $port,
         backend_host => $backend_host,
         backend_port => $backend_port,
-        tls_ctx      => $tls_ctx
+        tls_ctx      => $tls_ctx,
+        %args
     };
     bless $self, $class;
 
-    $self->{cv} = AnyEvent->condvar;
+    $self->{protocol} ||= 'http';
+    die "Unknown protocol '$self->{protocol}'"
+      unless $self->{protocol} =~ m/^http|raw$/;
+
+    $self->{pool}   ||= App::TLSMe::Pool->new;
+    $self->{logger} ||= $self->_build_logger($args{log_file});
+
+    if ($self->{pid_file}) {
+        $self->{pid_file} = File::Spec->rel2abs($self->{pid_file});
+    }
+
+    $self->_register_signals;
+
+    if ($self->{daemonize}) {
+        die "Log file is required when daemonizing\n"
+          unless $self->{log_file};
+
+        $self->_daemonize;
+    }
+
+    $self->_create_pidfile if $self->{pid_file};
 
     $self->_listen;
 
@@ -124,11 +118,138 @@ sub stop {
 
     $self->{cv}->send;
 
+    $self->_log('Shutting down');
+
     return $self;
+}
+
+sub _daemonize {
+    my $self = shift;
+
+    chdir '/' or die "Can't chdir to /: $!";
+
+    open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+    open STDOUT, '>', '/dev/null' or die "Can't write to /dev/null: $!";
+    open STDERR, '>', '/dev/null' or die "Can't write to /dev/null: $!";
+
+    defined(my $pid = fork) or die "Can't fork: $!";
+    exit if $pid;
+
+    die "Can't start a new session: $!" if setsid == -1;
+
+    return $self;
+}
+
+sub _create_pidfile {
+    my $self = shift;
+
+    $self->{pid} = Proc::Pidfile->new(pidfile => $self->{pid_file});
+
+    $self->_log('Created pid file: ' . $self->{pid}->pidfile);
+
+    return $self;
+}
+
+sub _parse_listen_address {
+    my $self = shift;
+    my ($address) = @_;
+
+    my ($host, $port) = split ':', $address, -1;
+    $host ||= '0.0.0.0';
+    $port ||= 443;
+
+    return ($host, $port);
+}
+
+sub _parse_backend_address {
+    my $self = shift;
+    my ($address) = @_;
+
+    my ($backend_host, $backend_port);
+
+    if ($address =~ m/:\d+$/) {
+        ($backend_host, $backend_port) = split ':', $address, -1;
+        $backend_host ||= '127.0.0.1';
+        $backend_port ||= 8080;
+    }
+    else {
+        $backend_host = 'unix/';
+        $backend_port = File::Spec->rel2abs($address);
+    }
+
+    return ($backend_host, $backend_port);
+}
+
+sub _build_tls_ctx {
+    my $self = shift;
+    my (%args) = @_;
+
+    my $tls_ctx = {method => delete $args{method}};
+
+    if (my $cipher_list = delete $args{cipher_list}) {
+        $tls_ctx->{cipher_list} = $cipher_list;
+    }
+
+    if (defined(my $cert_file = delete $args{cert_file})) {
+        Carp::croak("Certificate file '$cert_file' does not exist")
+          unless -f $cert_file;
+
+        $tls_ctx->{cert_file} = $cert_file;
+
+        if (defined(my $password = delete $args{cert_password})) {
+            if ($password eq '') {
+                print 'Enter certificate password: ';
+                system('stty', '-echo');
+                $password = <STDIN>;
+                system('stty', 'echo');
+                chomp $password;
+                print "\n";
+            }
+
+            $tls_ctx->{cert_password} = $password;
+        }
+
+        if (my $key_file = delete $args{key_file}) {
+            Carp::croak("Private key file '$key_file' does not exist")
+              unless -f $key_file;
+
+            $tls_ctx->{key_file} = $key_file;
+        }
+
+    }
+    else {
+        DEBUG && warn "Using default certificate and private key values\n";
+
+        $tls_ctx = {%$tls_ctx, cert => CERT, key => KEY};
+    }
+
+    return AnyEvent::TLS->new(%$tls_ctx);
+}
+
+sub _register_signals {
+    my $self = shift;
+
+    $SIG{__WARN__} = sub {
+        $self->_log(@_);
+    };
+
+    $SIG{__DIE__} = sub {
+        $self->_log(@_) if $self;
+        exit(1);
+    };
+
+    $SIG{TERM} = $SIG{INT} = sub {
+        $self->_log('Shutting down');
+        exit(0);
+    };
 }
 
 sub _listen {
     my $self = shift;
+
+    $self->_log('Starting up');
+
+    $self->{cv} = AnyEvent->condvar;
 
     tcp_server $self->{host}, $self->{port}, $self->_accept_handler,
       $self->_bind_handler;
@@ -140,10 +261,10 @@ sub _accept_handler {
     return sub {
         my ($fh, $peer_host, $peer_port) = @_;
 
-        DEBUG
-          && warn "Accepted connection $fh from $peer_host:$peer_port\n";
+        $self->_log("Accepted connection from $peer_host:$peer_port");
 
-        App::TLSMe::Pool->add_connection(
+        $self->{pool}->add_connection(
+            protocol     => $self->{protocol},
             fh           => $fh,
             backend_host => $self->{backend_host},
             backend_port => $self->{backend_port},
@@ -153,7 +274,9 @@ sub _accept_handler {
             on_eof       => sub {
                 my ($conn) = @_;
 
-                App::TLSMe::Pool->remove_connection($fh);
+                $self->_log("Closing connection from $peer_host:$peer_port");
+
+                $self->{pool}->remove_connection($fh);
             },
             on_error => sub {
                 my ($conn, $error) = @_;
@@ -161,18 +284,28 @@ sub _accept_handler {
                 if ($error =~ m/ssl23_get_client_hello: http request/) {
                     my $response = $self->_build_http_response(
                         '501 Not Implemented',
-                        '<h1>501 Not Implemented</h1><p>Maybe <code>https://</code> instead of <code>http://</code>?</p>'
+                        '<h1>501 Not Implemented</h1>'
+                          . '<p>Try <code>https://</code> instead of <code>http://</code>?</p>'
                     );
 
                     syswrite $fh, $response;
                 }
 
-                App::TLSMe::Pool->remove_connection($fh);
+                $self->_log(
+                    "Closing connection from $peer_host:$peer_port: $error");
+
+                $self->{pool}->remove_connection($fh);
+            },
+            on_backend_connected => sub {
+                $self->_log("Connected to backend");
             },
             on_backend_eof => sub {
+                $self->_log("Disconnected from backend");
             },
             on_backend_error => sub {
                 my ($conn, $message) = @_;
+
+                $self->_log("Disconnected from backend: $message");
 
                 my $response = $self->_build_http_response('502 Bad Gateway',
                     '<h1>502 Bad Gateway</h1>');
@@ -189,10 +322,30 @@ sub _bind_handler {
     return sub {
         my ($fh, $host, $port) = @_;
 
-        DEBUG && warn "Listening on $host:$port\n";
+        $self->_log("Listening on $host:$port");
 
-        return 8;
+        $self->_drop_privileges;
+
+        return $self->{backlog} || 128;
     };
+}
+
+sub _drop_privileges {
+    my $self = shift;
+
+    if ($self->{user}) {
+        $self->_log('Dropping privileges');
+
+        eval { require Privileges::Drop; 1 }
+          or do { die "Privileges::Drop is required\n" };
+
+        if ($self->{group}) {
+            Privileges::Drop::drop_uidgid($self->{user}, $self->{group});
+        }
+        else {
+            Privileges::Drop::drop_privileges($self->{user});
+        }
+    }
 }
 
 sub _build_http_response {
@@ -203,6 +356,26 @@ sub _build_http_response {
 
     return join "\015\012", "HTTP/1.1 $status_message",
       "Content-Length: $length", "", $body;
+}
+
+sub _log {
+    my $self = shift;
+
+    return unless $self->{logger};
+
+    $self->{logger}->log(@_);
+}
+
+sub _build_logger {
+    my $self = shift;
+    my ($log) = @_;
+
+    my $fh;
+    if ($log) {
+        open $fh, '>>', $log or die "Can't open log file '$log': $!";
+    }
+
+    return App::TLSMe::Logger->new(fh => $fh);
 }
 
 1;
@@ -264,7 +437,7 @@ Viacheslav Tykhanovskyi, C<vti@cpan.org>.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2011-2012, Viacheslav Tykhanovskyi
+Copyright (C) 2011-2013, Viacheslav Tykhanovskyi
 
 This program is free software, you can redistribute it and/or modify it under
 the terms of the Artistic License version 2.0.

@@ -19,21 +19,18 @@ my $port         = FreePort->get_free_port();
 my $backend_host = '127.0.0.1';
 my $backend_port = FreePort->get_free_port();
 
-tcp_server $backend_host, $backend_port, sub {
-    my ($fh, $host, $port) = @_;
-
-    syswrite $fh, "200 OK\015\012";
-};
-
 my $null = '';
 open my $fh, '>', \$null;
 my $tlsme = App::TLSMe->new(
-    logger  => App::TLSMe::Logger->new(fh => $fh),
-    listen  => "$host:$port",
-    backend => "$backend_host:$backend_port"
+    logger    => App::TLSMe::Logger->new(fh => $fh),
+    cert_file => 'tlive/cert',
+    key_file  => 'tlive/key',
+    listen    => "$host:$port",
+    backend   => "$backend_host:$backend_port"
 );
 
-my $handle = AnyEvent::Handle->new(
+my $response = '';
+my $handle; $handle = AnyEvent::Handle->new(
     connect => [$host, $port],
     tls     => "connect",
     tls_ctx => {},
@@ -42,9 +39,12 @@ my $handle = AnyEvent::Handle->new(
 
         $handle->push_read(
             line => sub {
-                is($_[1], '200 OK');
+                $response .= $_[1];
             }
         );
+    },
+    on_error => sub {
+        $tlsme->stop;
     },
     on_eof => sub {
         $tlsme->stop;
@@ -57,5 +57,7 @@ GET / HTTP/1.1
 EOF
 
 $tlsme->run;
+
+is($response, 'HTTP/1.1 502 Bad GatewayContent-Length: 24');
 
 done_testing;

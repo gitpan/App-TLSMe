@@ -1,5 +1,19 @@
 Revision history for perl module App::TLSMe
 
+0.11 2013-10-02
+
+ - Validate protocol name
+ - Splitted protocol specific connections
+ - Added more live tests
+ - Using handle connect instead of tcp_connect
+ - Added cipher_list option
+ - Added backlog option
+ - Added daemonize option
+ - Added password protected certificates handling
+ - Added log file
+ - Simplified connections pool
+ - Drop privileges
+
 0.10 2012-03-07
 
  - Fixed private file setting (reported by James D Bearden)
